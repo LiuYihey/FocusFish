@@ -1,0 +1,527 @@
+package com.focusfish.app.service
+
+import android.app.AlarmManager
+import android.app.Notification
+import android.app.usage.UsageStatsManager
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import com.focusfish.app.FocusFishApp
+import com.focusfish.app.MainActivity
+import com.focusfish.app.R
+import com.focusfish.app.ReflectionActivity
+import com.focusfish.app.data.local.AppDatabase
+import com.focusfish.app.detection.AppDetectionManager
+import com.focusfish.app.detection.QuizTrigger
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+/**
+ * 前台保活 + 轮询检测双引擎服务
+ *
+ * 核心作用（分发级可靠性）：
+ * 国产 ROM（MIUI/EMUI/ColorOS/vivo 等）会丢弃或延迟无障碍事件，
+ * 单靠无障碍服务检测被约束 APP 不可靠。
+ * 本服务作为第二引擎，每 1.5 秒通过 UsageStatsManager 主动轮询前台应用，
+ * 一旦发现被约束 APP 在前台即触发反思页，与无障碍服务互补。
+ *
+ * 两引擎均调用 AppDetectionManager.checkAndTrigger()，去重逻辑统一，不会重复弹窗。
+ *
+ * 前台服务拥有 BAL（后台 Activity 启动）权限，可在任意时刻启动 ReflectionActivity。
+ */
+class FocusFishService : android.app.Service() {
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var pollingJob: Job? = null
+
+    /**
+     * 上次检测到的前台包名缓存（修复 C）
+     *
+     * 问题：getForegroundPackage() 在用户停留同一应用 >5s 后，
+     * queryEvents 无新事件、queryUsageStats 的 lastTimeUsed 可能不刷新，
+     * 两个策略都返回 null，导致整个检测块被跳过——recurring 检测永远不执行。
+     *
+     * 解决：每次成功获取前台包名时缓存，getForegroundPackage() 返回 null 时
+     * 回退使用缓存值（CACHE_VALIDITY_MS 内有效）。
+     * 用户没切换应用 = 仍在缓存的应用里，用缓存值驱动 checkRecurringTrigger 是正确的。
+     */
+    private var lastKnownForeground: String? = null
+    private var lastKnownForegroundTime: Long = 0L
+
+    /**
+     * 连续检测到非拦截应用的次数（修复 B）
+     *
+     * 问题：clearAppEnterSession() 在 fg 为任何非拦截应用时立即调用，
+     * 但任务切换瞬间（ConfirmActivity finish → 目标应用上台的过渡帧）
+     * fg 可能短暂为桌面/输入法/系统组件 → 立即清空 lastAppEnterPkg →
+     * recurring 计时器还没开始走就被重置，永远到不了间隔。
+     *
+     * 解决：连续 CLEAR_SESSION_THRESHOLD 次检测到非拦截应用才清空会话，
+     * 过滤掉 <4.5s 的瞬态切换。
+     */
+    private var nonBlockedForegroundCount = 0
+
+    override fun onCreate() {
+        super.onCreate()
+        // 修复 F：确保守护开关和 recurring 会话状态已从 SharedPreferences 恢复
+        // 正常流程下 FocusFishApp.onCreate 已调用 init，但本服务可能被
+        // AlarmManager / BootReceiver 独立拉起（进程刚重建），双重保险确保状态就绪
+        AppDetectionManager.init(this)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
+        // 主动从数据库加载拦截列表，确保 polling 引擎启动时拦截列表已就绪
+        // 否则 blockedPackages 为空，shouldBlock 全返回 false，开机后到无障碍服务
+        // 连接前存在拦截失效窗口（无障碍服务可能延迟绑定，不能依赖它加载列表）
+        serviceScope.launch {
+            try {
+                val db = AppDatabase.getInstance(this@FocusFishService)
+                val activeApps = db.blockedAppDao().getActiveBlockedApps()
+                val packages = activeApps.map { it.packageName }.toSet()
+                AppDetectionManager.updateBlockedApps(packages)
+            } catch (e: Exception) {
+                // 加载失败忽略，无障碍服务连接时会再次加载
+            }
+        }
+        // 需求 1+4：前台服务启动时确认保活任务已注册
+        // 服务常驻时进程存活，无障碍服务不会被解绑；服务被杀死后由保活任务重建进程
+        KeepAliveManager.schedule(this)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 启动 / 重启轮询任务
+        startPollingIfNeeded()
+        // 返回 START_STICKY，服务被杀后系统会尝试重建
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
+    }
+
+    /**
+     * 修复 Bug 3：用户从最近任务列表划掉 app 时触发
+     * 原代码无此回调，导致用户划掉 app 后服务被杀、轮询停摆，
+     * 无障碍服务虽显示"已启用"但实际已失效（进程被杀，事件无法被处理）。
+     *
+     * 此处调度一个一次性的 AlarmManager 闹钟，1 秒后拉起服务：
+     * - 若守护开关已关闭，ServiceRestartReceiver.onReceive 会直接 return，不重启
+     * - 若守护开关仍开启，则拉起前台服务恢复轮询引擎
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        scheduleRestart()
+        super.onTaskRemoved(rootIntent)
+    }
+
+    override fun onDestroy() {
+        pollingJob?.cancel()
+        serviceScope.cancel()
+        // 修复 Bug 3：服务被系统回收时调度重启
+        // 与 onTaskRemoved 相同的恢复机制，确保服务在任何被杀场景下都能恢复
+        // 若守护开关已关闭，ServiceRestartReceiver 会直接 return，不会错误重启
+        scheduleRestart()
+        super.onDestroy()
+    }
+
+    /**
+     * 调度一次性服务重启闹钟（修复 Bug 3）
+     * 1 秒后触发 ServiceRestartReceiver，由其检查守护开关状态决定是否拉起服务
+     */
+    private fun scheduleRestart() {
+        if (!AppDetectionManager.isProtectionEnabled) return
+        try {
+            val alarmManager = getSystemService(android.content.Context.ALARM_SERVICE) as? AlarmManager
+                ?: return
+            val intent = android.content.Intent(this, ServiceRestartReceiver::class.java).apply {
+                action = ServiceRestartReceiver.ACTION_RESTART
+            }
+            val pendingIntent = android.app.PendingIntent.getBroadcast(
+                this,
+                ServiceRestartReceiver.REQUEST_CODE_RESTART,
+                intent,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            // 一次性闹钟，1 秒后触发（setExact 比 setInexactRepeating 更及时）
+            // Android 12+ 精确闹钟需要 SCHEDULE_EXACT_ALARM 权限且用户可随时撤销，
+            // 未授权时 setExactAndAllowWhileIdle 会抛 SecurityException →
+            // 降级为 setAndAllowWhileIdle（Doze 下仍可唤醒，仅时间不精确）。
+            val triggerAt = android.os.SystemClock.elapsedRealtime() + 1000L
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S &&
+                !KeepAliveManager.canScheduleExactAlarms(this)
+            ) {
+                alarmManager.setAndAllowWhileIdle(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    triggerAt,
+                    pendingIntent
+                )
+            } else if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    triggerAt,
+                    pendingIntent
+                )
+            } else {
+                alarmManager.setExact(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    triggerAt,
+                    pendingIntent
+                )
+            }
+        } catch (e: Exception) {
+            // 调度失败静默忽略，依赖 START_STICKY 和周期闹钟兜底
+        }
+    }
+
+    /**
+     * 启动前台应用轮询任务（幂等，重复调用安全）
+     * 每 POLL_INTERVAL_MS 毫秒检测一次前台应用：
+     * 1. 优先处理挂起的拦截请求（无障碍服务提交的，绕过BAL限制）
+     * 2. 心跳检测无障碍服务连接状态，断开时尝试触发重连
+     * 3. 若专注模式激活且用户切到其他应用 → 拉回 FocusFish（专注防分心）
+     * 4. 若守护开启且发现被约束 APP 全新打开/切回 → 触发反思页（checkAndTrigger）
+     * 5. 若守护开启且用户持续使用已进入的被约束 APP 达到「再次提醒间隔」→ 触发 recurring 反思页（checkRecurringTrigger）
+     * 6. 若用户持续离开已进入的被约束 APP（连续 CLEAR_SESSION_THRESHOLD 次检测到非拦截应用）→ 清空会话
+     *
+     * 修复 B：原逻辑检测到任何非拦截应用就立即 clearAppEnterSession，
+     * 任务切换瞬态（桌面/输入法过渡帧）会误清 recurring 计时器。
+     * 现改为连续 3 次（≈4.5s）才清空，过滤瞬态。
+     *
+     * 修复 C：getForegroundPackage() 在用户停留同一应用 >5s 后可能返回 null，
+     * 导致整个检测块被跳过、recurring 永不触发。现回退使用上次缓存的前台包名
+     * （5 分钟内有效），保证长停留场景下检测不中断。
+     */
+    private fun startPollingIfNeeded() {
+        if (pollingJob?.isActive == true) return
+        var heartbeatCounter = 0
+        pollingJob = serviceScope.launch {
+            while (true) {
+                try {
+                    // 每 HEARTBEAT_INTERVAL_TICKS 次轮询做一次心跳检测
+                    heartbeatCounter++
+                    if (heartbeatCounter >= HEARTBEAT_INTERVAL_TICKS) {
+                        heartbeatCounter = 0
+                        performAccessibilityHeartbeat()
+                    }
+
+                    // 优先级 0：处理挂起的拦截请求（无障碍服务提交的）
+                    // 由前台服务统一启动 Activity，避免 BAL 限制
+                    val pending = AppDetectionManager.consumePendingTrigger()
+                    if (pending != null) {
+                        val (pkg, trigger) = pending
+                        if (AppDetectionManager.shouldBlock(pkg) && !AppDetectionManager.isQuizShowing()) {
+                            AppDetectionManager.onQuizShown(pkg)
+                            launchReflectionActivity(pkg, trigger)
+                        }
+                    }
+
+                    // 获取前台包名（getForegroundPackage 内部已集成缓存策略）
+                    val fg = getForegroundPackage()
+
+                    if (fg != null) {
+                        // 优先级 1：专注模式防分心检测
+                        // 用户在专注计时中切到其他应用 → 立刻拉回 FocusFish
+                        if (com.focusfish.app.util.FocusSessionState.isActive &&
+                            fg != packageName &&
+                            fg != "com.android.systemui"
+                        ) {
+                            bringFocusBackToForeground()
+                        }
+
+                        // 优先级 2：被约束 APP 检测
+                        if (AppDetectionManager.isProtectionEnabled) {
+                            // 修复 B：去抖动清空会话
+                            // 任务切换瞬间 fg 可能短暂为桌面/输入法/系统组件，
+                            // 立即 clearAppEnterSession 会把 recurring 计时器清零。
+                            // 连续 CLEAR_SESSION_THRESHOLD 次检测到非拦截应用才清空，
+                            // 过滤掉 <4.5s 的瞬态切换。
+                            val isNonBlockedNonSelf = fg != packageName &&
+                                fg != "com.android.systemui" &&
+                                AppDetectionManager.isBlockedTarget(fg).not()
+                            if (isNonBlockedNonSelf) {
+                                nonBlockedForegroundCount++
+                                if (nonBlockedForegroundCount >= CLEAR_SESSION_THRESHOLD) {
+                                    AppDetectionManager.clearAppEnterSession()
+                                    nonBlockedForegroundCount = 0
+                                }
+                            } else {
+                                // fg 是拦截应用或自身，重置计数器
+                                nonBlockedForegroundCount = 0
+                            }
+
+                            // 优先级 2.5：结算到期的豁免窗口
+                            // 用户选定的使用时长已到 → 该应用重新被拦截；
+                            // 若此刻用户仍停留在该应用内，登记「时长到期」提醒。
+                            // 必须在这里做：只有轮询引擎掌握权威的前台应用信息，
+                            // 无障碍事件无法判断用户是否仍停留在应用内。
+                            val expiredReminderPkgs = AppDetectionManager.settleExpiredExemptions(fg)
+
+                            if (expiredReminderPkgs.isNotEmpty()) {
+                                // 到期提醒直接针对该包名弹窗，不依赖轮询观测到的 fg：
+                                // UsageStats 的前台信息存在刷新延迟，
+                                // fg 此刻可能仍指向用户早已离开的应用，导致提醒丢失。
+                                val target = expiredReminderPkgs.first()
+                                // BAL 限制：前台服务在后台启动 Activity 会被系统拦截，
+                                // 而「时长到期」只有轮询引擎能发现（它掌握权威到期时刻）。
+                                // 因此这里只登记启动请求，由拥有 BAL 豁免的无障碍服务真正拉起弹窗。
+                                AppDetectionManager.postPendingExpiryLaunch(target)
+                            } else {
+                                // 首次打开 / 切回：事件式触发
+                                val trigger = AppDetectionManager.checkAndTrigger(fg)
+                                    ?: AppDetectionManager.checkRecurringTrigger(fg)
+                                if (trigger != null) {
+                                    // EXPIRY 交给无障碍服务拉起（BAL 限制）：
+                                    // 由它在真正启动弹窗时才置 onQuizShown，
+                                    // 此处若提前置位会让无障碍侧误判"已有弹窗在显示"而放弃拉起。
+                                    if (trigger == QuizTrigger.EXPIRY) {
+                                        AppDetectionManager.postPendingExpiryLaunch(fg)
+                                    } else {
+                                        AppDetectionManager.onQuizShown(fg)
+                                        launchReflectionActivity(fg, trigger)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    // 协程取消必须重新抛出，否则服务销毁后协程会延迟退出
+                    throw e
+                } catch (e: Exception) {
+                    // 单次轮询失败不影响后续轮询
+                }
+                delay(POLL_INTERVAL_MS)
+            }
+        }
+    }
+
+    /**
+     * 无障碍服务心跳检测
+     *
+     * 注意：Android 不允许代码直接开启无障碍服务，只能引导用户去系统设置开启。
+     * 此处的作用：
+     * 1. 确保前台服务自身存活（防止被系统回收导致轮询中断）
+     * 2. 当无障碍断开时，前台服务自身的轮询引擎继续作为兜底
+     *    （isAccessibilityConnected 状态已通过 StateFlow 自动同步给 UI，
+     *     UI 会在权限页提示用户重新启用）
+     */
+    private fun performAccessibilityHeartbeat() {
+        if (!AppDetectionManager.isProtectionEnabled) return
+        // 重提升前台状态，防止系统在低内存时把服务降级
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification())
+            }
+        } catch (e: Exception) {
+            // 重提升失败静默忽略（如服务已被销毁）
+        }
+        // 需求 1+4：无障碍服务健康自检
+        // - 系统开关仍在但服务没连上 → 保活任务会重建进程并触发系统自动重绑
+        // - 系统开关已被关闭 → 打标记，由设置页引导卡片提示用户手动重新开启
+        KeepAliveManager.checkAccessibilityHealth(this)
+    }
+
+    /**
+     * 把 FocusFish 主界面拉回前台（专注模式防分心）
+     * 通过 MainActivity Intent，Intent extra 标记 "focus_mode" 让 MainScreen 自动跳到 Focus 路由
+     */
+    private fun bringFocusBackToForeground() {
+        try {
+            val intent = Intent(this, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                putExtra(MainActivity.EXTRA_FOCUS_MODE_RECALL, true)
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            // 启动失败静默忽略，下次轮询会重试
+        }
+    }
+
+    /**
+     * 通过 UsageStatsManager 获取当前前台应用包名
+     *
+     * 三级策略检测，兼顾精确性、性能和可靠性：
+     *
+     * 策略 1（轻量）：queryEvents 查询最近 QUERY_WINDOW_MS 内的 ACTIVITY_RESUMED 事件
+     *   —— 精确检测应用切换，IPC 开销低
+     *   —— 窗口必须显著大于 UsageStats 的事件入库延迟：
+     *     事件是批量延迟入库的，若窗口太短，延迟入库的切换事件会被永久错过，
+     *     缓存就会一直停在旧包名（曾导致「使用时长到期」不弹提醒）
+     *
+     * 策略 2（缓存）：当 queryEvents 返回空（用户停留同一应用无新事件）时，
+     *   优先使用 lastKnownForeground 缓存（2h 内有效）
+     *   —— 避免每 1.5s 调用昂贵的 queryUsageStats(2h)，这是性能优化的关键
+     *   —— 用户没切换应用 = 仍在缓存的应用里，用缓存值驱动检测是正确的
+     *
+     * 策略 3（兜底）：无缓存或缓存过期时，queryUsageStats 查询 2h 窗口取 lastTimeUsed 最大的应用
+     *   —— 重量级 IPC 调用，只在首次启动或缓存过期（2h）时执行
+     *
+     * 关键：必须使用 queryEvents / queryUsageStats（返回所有应用数据），不能用 queryEventsForSelf
+     * （后者只返回调用应用自身事件，无法监控其他应用）
+     *
+     * @return 前台包名，无权限或无数据时返回 null
+     */
+    private fun getForegroundPackage(): String? {
+        val usm = getSystemService(USAGE_STATS_SERVICE) as? UsageStatsManager ?: return null
+        val now = System.currentTimeMillis()
+
+        // 策略 1：queryEvents 查询事件流（轻量）
+        val events = try {
+            usm.queryEvents(now - QUERY_WINDOW_MS, now)
+        } catch (e: Exception) {
+            null
+        }
+
+        if (events != null) {
+            var lastFgPackage: String? = null
+            val resumeEventType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED
+            } else {
+                @Suppress("DEPRECATION")
+                android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND
+            }
+            while (events.hasNextEvent()) {
+                val event = android.app.usage.UsageEvents.Event()
+                events.getNextEvent(event)
+                if (event.eventType == resumeEventType) {
+                    lastFgPackage = event.packageName
+                }
+            }
+            if (lastFgPackage != null) {
+                // 检测到应用切换事件，更新缓存并返回
+                lastKnownForeground = lastFgPackage
+                lastKnownForegroundTime = now
+                return lastFgPackage
+            }
+            // queryEvents 返回空 = 5s 内无应用切换 = 用户仍在同一应用
+            // 策略 2：优先使用缓存，避免每 1.5s 调用 queryUsageStats(2h) 的性能灾难
+            val cached = lastKnownForeground
+            val cachedAge = now - lastKnownForegroundTime
+            if (cached != null && cachedAge < CACHE_VALIDITY_MS) {
+                return cached
+            }
+        } else {
+            // queryEvents 本身异常时，也尝试缓存
+            val cached = lastKnownForeground
+            val cachedAge = now - lastKnownForegroundTime
+            if (cached != null && cachedAge < CACHE_VALIDITY_MS) {
+                return cached
+            }
+        }
+
+        // 策略 3：queryUsageStats 兜底（重量级，只在无事件且无缓存时调用）
+        return try {
+            val stats = usm.queryUsageStats(
+                UsageStatsManager.INTERVAL_BEST,
+                now - STATS_WINDOW_MS,
+                now
+            )
+            val result = stats?.maxByOrNull { it.lastTimeUsed }?.packageName
+            if (result != null) {
+                lastKnownForeground = result
+                lastKnownForegroundTime = now
+            }
+            result
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 启动反思拦截页面
+     * 前台服务拥有 BAL 权限，可直接 startActivity
+     * @param targetPackage 触发的应用包名
+     * @param trigger 触发类型（首次拦截 / 持续使用再次提醒 / 使用时长到期）
+     *
+     * recurring 场景下 elapsedMin 取真实累计使用时长（修复 P0-2），
+     * 让用户看到自己真实的使用时长，而非设置间隔值。
+     */
+    private fun launchReflectionActivity(targetPackage: String, trigger: QuizTrigger) {
+        try {
+            val elapsedMin = if (trigger == QuizTrigger.RECURRING) {
+                AppDetectionManager.getAppEnterElapsedMin(targetPackage)
+            } else 0
+            val intent = Intent(this, ReflectionActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                putExtra(ReflectionActivity.EXTRA_TARGET_PACKAGE, targetPackage)
+                putExtra(ReflectionActivity.EXTRA_TRIGGER, trigger.name)
+                if (trigger == QuizTrigger.RECURRING) {
+                    putExtra(ReflectionActivity.EXTRA_ELAPSED_MIN, elapsedMin)
+                }
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            // 启动失败时重置去重状态，以便下次重试
+            AppDetectionManager.onQuizDismissed()
+        }
+    }
+
+    /**
+     * 构建前台通知
+     *
+     * 需求 2：应用已取消一切用户可见通知，也不申请通知权限。
+     * 但 Android 规定前台服务必须关联一条通知才能保持存活，
+     * 因此这里只保留一条"最低优先级、无声、无角标、不可交互"的占位通知 ——
+     * 它不会出现在通知列表中打扰用户，仅用于满足系统对前台服务的强制要求。
+     */
+    private fun buildNotification(): Notification {
+        return NotificationCompat.Builder(this, FocusFishApp.NOTIFICATION_CHANNEL_ID)
+            .setContentTitle(getString(R.string.notification_title))
+            .setContentText(getString(R.string.notification_text))
+            .setSmallIcon(R.drawable.ic_shield)
+            .setOngoing(true)
+            .setSilent(true)
+            .setShowWhen(false)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .build()
+    }
+
+    companion object {
+        /** 前台通知 ID */
+        const val NOTIFICATION_ID = 1001
+        /** 轮询间隔（毫秒）- 1.5 秒，兼顾响应速度与电量 */
+        private const val POLL_INTERVAL_MS = 1500L
+        /** queryEvents 查询时间窗口（毫秒）- 查询最近 60 秒事件
+         *
+         * 修复：原 5s 窗口会永久错过「延迟入库」的切换事件。
+         * UsageStats 事件是批量异步入库的，入库延迟可达数十秒；
+         * 一旦错过窗口，该切换事件就再也读不到，
+         * 前台包名缓存会一直停在旧值（曾导致「使用时长到期」既不弹提醒也不恢复拦截）。
+         * 60s 窗口可覆盖常见入库延迟，且 IPC 开销与 5s 基本相同。
+         */
+        private const val QUERY_WINDOW_MS = 60_000L
+        /** queryUsageStats 兜底查询窗口（毫秒）- 2 小时，覆盖最大 recurring 间隔 120 分钟
+         *  修复盲区：原 60s 窗口在用户停留同一应用 >60s 后失效，导致 recurring 永不触发 */
+        private const val STATS_WINDOW_MS = 2 * 60 * 60 * 1000L
+        /** 心跳检测间隔（轮询次数）- 每 30 次轮询检测一次，约 45 秒 */
+        private const val HEARTBEAT_INTERVAL_TICKS = 30
+        /** 前台包名缓存有效期（毫秒）- 2 小时，覆盖最大 recurring 间隔 120 分钟
+         *  修复盲区：原 5 分钟缓存短于默认 30 分钟 recurring 间隔，导致持续使用 >5min 后
+         *  检测停摆，recurring 永不触发。现扩展到 2 小时，确保覆盖最大间隔场景 */
+        private const val CACHE_VALIDITY_MS = 2 * 60 * 60 * 1000L
+        /** 清空会话去抖动阈值（连续检测到非拦截应用的次数）- 3 次 ≈ 4.5 秒，过滤瞬态切换 */
+        private const val CLEAR_SESSION_THRESHOLD = 3
+    }
+}

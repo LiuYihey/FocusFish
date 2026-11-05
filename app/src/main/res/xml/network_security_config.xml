@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  大肥鱼的 API 地址完全由用户自己填，所以必须允许明文 HTTP：
+  - 本地 Ollama / LM Studio（http://10.0.2.2:11434 或 http://192.168.x.x）
+  - 局域网里自建的一键包（one-api / new-api 等）
+  部分厂商的 base config 仍保持明文关闭，只对已知本地地址放行。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
