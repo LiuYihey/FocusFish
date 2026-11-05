@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      桌宠开机自启的中转 Activity 用的透明主题。
+      关键点：
+      - windowIsTranslucent + windowBackground 透明 → 用户看不到这个 Activity
+      - windowNoTitle / windowContentOverlay → 不显示标题栏
+      - excludeFromRecents → 不出现在最近任务里
+      - windowIsFloating → 独立小窗，不占满屏
+    -->
+    <style name="Theme.FocusFish.PetBoot" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowIsFloating">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+</resources>

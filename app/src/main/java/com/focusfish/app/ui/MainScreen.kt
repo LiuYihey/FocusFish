@@ -70,6 +70,7 @@ import com.focusfish.app.ui.settings.AiSettingsScreen
 import com.focusfish.app.ui.settings.PersonaScreen
 import com.focusfish.app.ui.settings.BooksScreen
 import com.focusfish.app.ui.settings.MemoryScreen
+import com.focusfish.app.ui.settings.PetSettingsScreen
 
 /**
  * 底部导航项数据类
@@ -224,6 +225,17 @@ private fun MainTabScreen() {
         }
     }
 
+    // 收集「桌宠点击」事件：DesktopPetService 发射 → 跳到 Chat 路由
+    val navigateToChat by com.focusfish.app.MainActivity.navigateToChatEvent.collectAsStateWithLifecycle()
+    LaunchedEffect(navigateToChat) {
+        if (navigateToChat) {
+            com.focusfish.app.MainActivity.requestNavigateToChatConsumed()
+            navController.navigate("chat") {
+                launchSingleTop = true
+            }
+        }
+    }
+
     // 当前路由是否为全屏页（专注模式）：全屏时隐藏底部导航栏
     val currentRoute = currentDestination?.route
     val isFullScreen = currentRoute == "focus"
@@ -302,6 +314,9 @@ private fun MainTabScreen() {
                     },
                     onNavigateToMemory = {
                         navController.navigate("memory")
+                    },
+                    onNavigateToPet = {
+                        navController.navigate("pet")
                     }
                 )
             }
@@ -360,6 +375,12 @@ private fun MainTabScreen() {
             // 大肥鱼的记忆
             composable(route = "memory") {
                 MemoryScreen(
+                    onBack = { navController.popBackStack() }
+                )
+            }
+            // 桌面大肥鱼（桌宠）
+            composable(route = "pet") {
+                PetSettingsScreen(
                     onBack = { navController.popBackStack() }
                 )
             }

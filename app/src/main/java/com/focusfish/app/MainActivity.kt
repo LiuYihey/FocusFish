@@ -40,6 +40,12 @@ class MainActivity : ComponentActivity() {
         /** Intent extra：专注模式防分心拉回标记，FocusFishService 检测到用户切屏时带上 */
         const val EXTRA_FOCUS_MODE_RECALL = "focus_mode_recall"
 
+        /** Intent extra：桌宠点击后要打开聊天页 */
+        const val EXTRA_OPEN_CHAT = "open_chat"
+
+        /** Intent extra：桌宠双击后要打开投喂页 */
+        const val EXTRA_OPEN_FEEDING = "open_feeding"
+
         /** 一次性导航事件流：从 ConfirmActivity "去投喂"跳转时发射 true，MainScreen 收集后跳大肥鱼 Tab */
         private val _navigateToFishEvent = MutableStateFlow(false)
         val navigateToFishEvent = _navigateToFishEvent.asStateFlow()
@@ -81,6 +87,20 @@ class MainActivity : ComponentActivity() {
         fun requestFocusRecallConsumed() {
             _focusRecallEvent.value = false
         }
+
+        /** 一次性导航事件流：桌宠点击后发射 true，MainScreen 跳 Chat 路由 */
+        private val _navigateToChatEvent = MutableStateFlow(false)
+        val navigateToChatEvent = _navigateToChatEvent.asStateFlow()
+
+        /** 供 DesktopPetService 调用：打开聊天页 */
+        fun requestNavigateToChat() {
+            _navigateToChatEvent.value = true
+        }
+
+        /** 供 MainScreen 消费后调用：重置标志 */
+        fun requestNavigateToChatConsumed() {
+            _navigateToChatEvent.value = false
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -89,6 +109,10 @@ class MainActivity : ComponentActivity() {
         // 专注模式防分心拉回：FocusFishService 检测到用户切屏后通过 Intent extra 通知
         if (intent.getBooleanExtra(EXTRA_FOCUS_MODE_RECALL, false)) {
             requestFocusRecall()
+        }
+        // 桌宠点击 → 打开聊天页
+        if (intent.getBooleanExtra(EXTRA_OPEN_CHAT, false)) {
+            requestNavigateToChat()
         }
     }
 

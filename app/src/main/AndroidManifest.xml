@@ -142,9 +142,39 @@
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
+        <!-- 桌宠开机自启
+             Android 15 起后台不能直接起前台服务，
+             所以走「透明中转 Activity」在可见状态下启动。 -->
+        <receiver
+            android:name=".pet.PetBootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 桌宠自启中转 Activity（透明，用户看不到） -->
+        <activity
+            android:name=".pet.PetBootActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:theme="@style/Theme.FocusFish.PetBoot" />
+
         <!-- 前台保活服务 -->
         <service
             android:name=".service.FocusFishService"
+            android:foregroundServiceType="specialUse"
+            android:exported="false" />
+
+        <!-- 桌宠悬浮窗服务
+             Android 8.0+ 后台不能显示悬浮窗，必须挂在前台服务上。
+             Android 14+ 要求声明具体类型 —— 桌宠归类为 specialUse。
+             Android 15 起要求起服务前已有可见叠加层，所以只能由用户主动开启时启动。 -->
+        <service
+            android:name=".pet.DesktopPetService"
             android:foregroundServiceType="specialUse"
             android:exported="false" />
 

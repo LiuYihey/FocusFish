@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  桌宠长按菜单
+
+  刻意做短：只放真正有用的 6 项。
+  桌宠用户研究的第一条教训是「91 段动画里用户只会记住 3-5 个」，
+  菜单同理 —— 项太多等于没有重点。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:background="@drawable/pet_menu_background"
+    android:orientation="vertical"
+    android:paddingVertical="6dp">
+
+    <TextView
+        android:id="@+id/menuSpeak"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?android:attr/selectableItemBackground"
+        android:paddingHorizontal="18dp"
+        android:paddingVertical="11dp"
+        android:text="说句话"
+        android:textColor="#2B3A4A"
+        android:textSize="14sp" />
+
+    <TextView
+        android:id="@+id/menuSleep"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?android:attr/selectableItemBackground"
+        android:paddingHorizontal="18dp"
+        android:paddingVertical="11dp"
+        android:text="睡觉 / 醒来"
+        android:textColor="#2B3A4A"
+        android:textSize="14sp" />
+
+    <TextView
+        android:id="@+id/menuHome"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?android:attr/selectableItemBackground"
+        android:paddingHorizontal="18dp"
+        android:paddingVertical="11dp"
+        android:text="回到右上角"
+        android:textColor="#2B3A4A"
+        android:textSize="14sp" />
+
+    <TextView
+        android:id="@+id/menuFlip"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?android:attr/selectableItemBackground"
+        android:paddingHorizontal="18dp"
+        android:paddingVertical="11dp"
+        android:text="换个方向"
+        android:textColor="#2B3A4A"
+        android:textSize="14sp" />
+
+    <TextView
+        android:id="@+id/menuHide"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?android:attr/selectableItemBackground"
+        android:paddingHorizontal="18dp"
+        android:paddingVertical="11dp"
+        android:text="藏起来 / 唤回"
+        android:textColor="#2B3A4A"
+        android:textSize="14sp" />
+
+    <TextView
+        android:id="@+id/menuQuit"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?android:attr/selectableItemBackground"
+        android:paddingHorizontal="18dp"
+        android:paddingVertical="11dp"
+        android:text="关闭桌宠"
+        android:textColor="#C0453B"
+        android:textSize="14sp" />
+
+</LinearLayout>

@@ -102,6 +102,7 @@ fun SettingsScreen(
     onNavigateToPersona: () -> Unit = {},
     onNavigateToBooks: () -> Unit = {},
     onNavigateToMemory: () -> Unit = {},
+    onNavigateToPet: () -> Unit = {},
     viewModel: SettingsViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -297,6 +298,16 @@ fun SettingsScreen(
                     onClick = {
                         hapticFeedback.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onNavigateToMemory()
+                    }
+                )
+                IosDivider()
+                // 桌宠设置（导航行）
+                IosNavigationRow(
+                    icon = Icons.Filled.Pets,
+                    title = "桌面大肥鱼",
+                    onClick = {
+                        hapticFeedback.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onNavigateToPet()
                     }
                 )
             }

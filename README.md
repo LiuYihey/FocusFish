@@ -50,10 +50,38 @@ FocusFish 是一个 Android 专注陪伴 App，由 [FocusCat](https://github.com
 - 打开约束 App → 反思问答 → 选择退出 → 弹出**大肥鱼表情包鼓励** → 把你送回桌面
 - 专注模式下切屏检测，离开即提醒
 
-### 🐾 桌面桌宠（开发中）
+### 🐾 桌面桌宠
 
-像 dsh 电脑版那样的桌面电子宠物，常驻手机桌面。
-见 [docs/桌宠设计.md](docs/桌宠设计.md)。
+像 dsh 电脑版那样的桌面电子宠物，常驻在手机桌面 —— 你在别的 App 里摸鱼的时候，它也飘在旁边盯着你。
+
+| 交互 | 反应 |
+|---|---|
+| 点它 | Q 弹挤压 + 随机表情 + 台词气泡 |
+| 双击 | 投喂大白饭 |
+| 按住拖动 | **弹簧跟手**（不是硬贴），侧身朝向拖动方向，松手说话 |
+| 快速甩一下 | 抛物线飞行，撞屏幕边缘反弹，落地摩擦减速 |
+| 自主散步 | 沿屏幕底部走，走到边界掉头 |
+| 贴边 | 拖到边缘自动贴上，静置 12 秒缩进去只露半个身子，碰一下探出 |
+| 长按 | 菜单：说句话 / 睡觉 / 回到右上角 / 换个方向 / 藏起来 / 关闭 |
+
+**技术路线**：Overlay 悬浮窗（`TYPE_APPLICATION_OVERLAY`）+ 前台服务。
+
+> 为什么不用 Live Wallpaper？因为**切到任何 App 立刻消失** ——
+> 而陪伴的价值恰恰在「你不在时它也在」。
+
+**它跟 App 里的状态是联动的**（这是 FocusFish 相对 dsh-pet 的独有价值）：
+
+| App 内状态 | 桌宠表现 |
+|---|---|
+| 饱腹度 < 25 | 换成饿相，偶尔冒「……本鲸的白饭呢」 |
+| 正在睡觉 | 闭眼、呼吸变慢变沉 |
+| 心情低落 | 换成委屈脸 |
+| 好感度高 | 换成得意脸 |
+| 你正在专注 | **不主动说话**，安静陪你 |
+
+物理参数照搬 dsh-pet 电脑版：弹簧 K=200 / C=30、重力 1400、落地恢复 0.78、地面摩擦 2.5。
+
+设计细节见 [docs/桌宠设计.md](docs/桌宠设计.md)。
 
 ---
 
@@ -112,9 +140,12 @@ copy gradle.properties.example gradle.properties
 ## 致谢
 
 - [FocusCat](https://github.com/LiuYihey/FocusCat) —— 本项目的地基，双引擎拦截与专注逻辑来自它
+- [dsh-pet](https://github.com/PC2005-cloud/dsh-pet) —— 桌宠交互与物理参数的蓝本（5.5k★ MIT）
+- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) —— dsh 插件生态本体
 - [dsh-speak-up](https://github.com/Yuuyoko-uu/dsh-speak-up) —— 主动开口的命中线公式
 - [dsh-whale-musume](https://github.com/Sutera-Diffusus/dsh-whale-musume) —— 双档冷却与本地台词库的思路
 - [dsh-fish-memory](https://blog.csdn.net/m0_73859037/article/details/169645300) —— 记忆半衰期与注入上限的参数
+- [Michitop 桌宠用户研究](https://edwardyi.me/pdf/Michitop_Paper.pdf) —— 桌宠交互的反面清单
 
 ## License
 
